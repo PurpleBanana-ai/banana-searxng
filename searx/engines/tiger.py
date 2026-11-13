@@ -11,7 +11,6 @@ from urllib.parse import urlencode
 import typing as t
 
 from dateutil import parser
-from lxml import html
 
 from searx.exceptions import SearxEngineAPIException
 from searx.extended_types import SXNG_Response
@@ -44,19 +43,20 @@ Possible values: "Websuche", "News".
 CACHE: EngineCache
 """Cache to store session codes (result of solved CAPTCHA)."""
 
-
-def init(_):
-    if tiger_category not in ("Websuche", "News"):
-        raise ValueError("invalid search category: %s" % tiger_category)
+_TIGER_SESSION_COOKIE = "Tiger.ch"
+_ASP_NET_SESSION_COOKIE = "ASP.NET_SessionId"
 
 
 def setup(engine_settings: dict[str, t.Any]) -> bool:
+    if tiger_category not in ("Websuche", "News"):
+        raise ValueError("invalid search category: %s" % tiger_category)
+
     global CACHE  # pylint: disable=global-statement
     CACHE = EngineCache(engine_settings["name"])
     return True
 
 
-def _obtain_session_code() -> str:
+def _obtain_session_code() -> tuple[str, str]:
     """The challenge works like this:
 
     - We first generate 3 random numbers.
@@ -71,10 +71,13 @@ def _obtain_session_code() -> str:
     """
     cached_session = CACHE.get("session")
     if cached_session:
-        return cached_session
+        return cached_session.split("|")
 
-    results_page = get(f"{base_url}/checkCode.aspx")
-    doc = html.fromstring(results_page.text)
+    challenge_page = get(f"{base_url}/checkCode.aspx")
+    asp_session = challenge_page.cookies[_ASP_NET_SESSION_COOKIE]
+    if not asp_session:
+        raise SearxEngineAPIException("missing asp session cookie")
+    doc = challenge_page.html()
 
     extra_data: dict[str, str] = {}
     for extra_param in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"):
@@ -87,7 +90,7 @@ def _obtain_session_code() -> str:
     num2 = random.randint(1, 9)
     num3 = random.randint(1, 9)
 
-    challenge = get(f"{base_url}/Services/Human.svc/Make?M1={num1}&M2={num2}&M3={num3}", cookies=results_page.cookies)
+    challenge = get(f"{base_url}/Services/Human.svc/Make?M1={num1}&M2={num2}&M3={num3}", cookies=challenge_page.cookies)
     signs = loads(challenge.json()["d"])[0]
     sign1 = signs["Z1"]
     sign2 = signs["Z2"]
@@ -108,31 +111,34 @@ def _obtain_session_code() -> str:
 
     challenge_response = post(
         f"{base_url}/checkCode.aspx",
-        cookies=results_page.cookies,
+        cookies=challenge_page.cookies,
         data=data,
     )
 
-    cookie = challenge_response.cookies["Tiger.ch"]
+    cookie = challenge_response.cookies[_TIGER_SESSION_COOKIE]
     code = extr(cookie, "Code=", "&")
     if not code:
         raise SearxEngineAPIException("failed to obtain session code")
 
-    CACHE.set("session", code, expire=60 * 24 * 60 * 60)  # cookie is valid for two months
-    return code
+    CACHE.set("session", f"{code}|{asp_session}", expire=60 * 24 * 60 * 60)  # cookie is valid for two months
+    return code, asp_session
 
 
 def request(query: str, params: "OnlineParams"):
-    code = _obtain_session_code()
+    code, asp_session = _obtain_session_code()
     args = {"w": query, "page": params["pageno"]}
     params["url"] = f"{base_url}/{tiger_category}?{urlencode(args)}"
     # Setting Checked=1 shows related search terms / suggestions
     # Language and country could be set with Lng= and Land= in the future
-    params["cookies"]["Tiger.ch"] = f"Tiger.ch=&Code={code}&Checked=1"
+    params["cookies"] = {
+        _TIGER_SESSION_COOKIE: f"Code={code}&Checked=1",
+        _ASP_NET_SESSION_COOKIE: asp_session,
+    }
 
 
 def response(resp: "SXNG_Response") -> EngineResults:
     res = EngineResults()
-    doc = html.fromstring(resp.text)
+    doc = resp.html()
 
     if tiger_category == "Websuche":
         for result in eval_xpath_list(doc, "//div[@id='mainContainer']//table/tr"):

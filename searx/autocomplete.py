@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 
 import lxml.etree
 import lxml.html
-from httpx import HTTPError
+from curl_cffi.requests.exceptions import RequestException
 
 from searx import settings
 from searx.engines import (
@@ -28,19 +28,19 @@ if t.TYPE_CHECKING:
     from searx.extended_types import SXNG_Response
 
 
-def update_kwargs(**kwargs) -> None:  # type: ignore
+def update_kwargs(kwargs) -> None:  # type: ignore
     if 'timeout' not in kwargs:
         kwargs['timeout'] = settings['outgoing']['request_timeout']
     kwargs['raise_for_httperror'] = True
 
 
 def get(*args, **kwargs) -> "SXNG_Response":  # type: ignore
-    update_kwargs(**kwargs)  # pyright: ignore[reportUnknownArgumentType]
+    update_kwargs(kwargs)
     return http_get(*args, **kwargs)  # pyright: ignore[reportUnknownArgumentType]
 
 
 def post(*args, **kwargs) -> "SXNG_Response":  # type: ignore
-    update_kwargs(**kwargs)  # pyright: ignore[reportUnknownArgumentType]
+    update_kwargs(kwargs)
     return http_post(*args, **kwargs)  # pyright: ignore[reportUnknownArgumentType]
 
 
@@ -63,7 +63,7 @@ def bing(query: str, _sxng_locale: str) -> list[str]:
     base_url = "https://www.bing.com/AS/Suggestions?"
     # cvid has to be a 32 character long string consisting of numbers and uppsercase characters
     cvid = ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
-    response = get(base_url + urlencode({'qry': query, 'csr': 1, 'cvid': cvid}))
+    response = get(base_url + urlencode({'qry': query, 'csr': 1, 'cvid': cvid}), enable_http3=True)
     results: list[str] = []
 
     if response.ok:
@@ -83,7 +83,7 @@ def brave(query: str, _sxng_locale: str) -> list[str]:
     url = 'https://search.brave.com/api/suggest?'
     url += urlencode({'q': query})
     country = 'all'
-    kwargs = {'cookies': {'country': country}}
+    kwargs = {'cookies': {'country': country}, 'enable_http3': True}
     resp = get(url, **kwargs)
     results: list[str] = []
 
@@ -147,7 +147,7 @@ def google_complete(query: str, sxng_locale: str) -> list[str]:
     )
     results: list[str] = []
 
-    resp = get('https://www.google.com/complete/search?' + args)
+    resp = get('https://www.google.com/complete/search?' + args, enable_http3=True)
     if resp and resp.ok:
         json_txt = resp.text[resp.text.find('[') : resp.text.find(']', -3) + 1]
         data = json.loads(json_txt)
@@ -418,5 +418,5 @@ def search_autocomplete(backend_name: str, query: str, sxng_locale: str) -> list
         return []
     try:
         return backend(query, sxng_locale)
-    except (HTTPError, SearxEngineResponseException):
+    except (RequestException, SearxEngineResponseException):
         return []

@@ -30,8 +30,6 @@ web_base_url = "https://yep.com"
 safesearch = True
 safesearch_map = {0: "off", 1: "moderate", 2: "strict"}
 
-enable_http2 = False
-
 results_per_page = 20
 
 _IMPORT_RE = re.compile(r"import\"(.*?)\";")
@@ -50,9 +48,7 @@ def request(query: str, params: "OnlineParams") -> None:
         {
             "Referer": f"{web_base_url}/",
             "Origin": web_base_url,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
+            "x-csrf-protection": "1",
         }
     )
 
@@ -85,7 +81,6 @@ def fetch_traits(engine_traits: "EngineTraits"):
 
     # pylint: disable=import-outside-toplevel, too-many-branches
 
-    from lxml import html
     import babel
 
     from searx.locales import language_tag
@@ -105,7 +100,7 @@ def fetch_traits(engine_traits: "EngineTraits"):
     if not resp.ok:
         raise RuntimeError("Response from Yep languages is not OK.")
 
-    doc = html.fromstring(resp.text)
+    doc = resp.html()
     url = eval_xpath_getindex(doc, "//script[contains(@src, 'PageApp')]/@src", index=0)
 
     resp = get("https:" + extract_text(url), headers=headers, timeout=5)

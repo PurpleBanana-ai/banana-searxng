@@ -2,6 +2,8 @@
 # -*- coding: utf-8; mode: sh indent-tabs-mode: nil -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+export SEARXNG_CONTACT_URL="${SEARXNG_CONTACT_URL:-coolbot@example.org}"
+
 # shellcheck disable=SC2034
 main_cmd="$(basename "$0")"
 
@@ -48,7 +50,7 @@ PATH="${PY_ENV}/bin:${REPO_ROOT}/node_modules/.bin:${GOROOT}/bin:${GOPATH}/bin:$
 
 PYOBJECTS="searx"
 PY_SETUP_EXTRAS='[test]'
-GECKODRIVER_VERSION="v0.37.0"
+GECKODRIVER_VERSION="v0.37.1"
 # SPHINXOPTS=
 BLACK_OPTIONS=("--target-version" "py311" "--line-length" "120" "--skip-string-normalization")
 BLACK_TARGETS=("--exclude" "(searx/static|searx/languages.py)" "--include" 'searxng.msg|\.pyi?$' "searx" "searxng_extra" "tests")
@@ -112,6 +114,7 @@ dev.:
   env: enter developer environment (or exec a command in)
 environment ...
   SEARXNG_VALKEY_URL : ${SEARXNG_VALKEY_URL}
+  SEARXNG_CONTACT_URL: ${SEARXNG_CONTACT_URL}
 EOF
 }
 

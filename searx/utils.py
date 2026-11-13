@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Utility functions for the engines"""
 
-import time
+from hashlib import pbkdf2_hmac, sha256
 
+import hashlib
 import re
 import importlib
 import importlib.util
 import json
+import string
 import types
 
 import typing as t
@@ -19,16 +21,24 @@ from html.parser import HTMLParser
 from html import escape
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from datetime import timedelta
+from time import sleep
 from markdown_it import MarkdownIt
 
 from lxml import html
 from lxml.etree import XPath, XPathError, XPathSyntaxError
 from lxml.etree import ElementBase, _Element  # pyright: ignore[reportPrivateUsage]
 
-from searx import settings
+from searx import settings, get_setting
 from searx.data import USER_AGENTS
 from searx.version import VERSION_TAG
-from searx.exceptions import SearxXPathSyntaxException, SearxEngineXPathException
+from searx.exceptions import (
+    SearxEngineCaptchaException,
+    SearxXPathSyntaxException,
+    SearxEngineXPathException,
+    SearxEngineAPIException,
+)
+from searx.extended_types import SXNG_Response
+from searx.network import get
 from searx import logger
 
 logger = logger.getChild('utils')
@@ -66,9 +76,25 @@ class _NotSetClass:  # pylint: disable=too-few-public-methods
 _NOTSET = _NotSetClass()
 
 
-def searxng_useragent() -> str:
-    """Return the SearXNG User Agent"""
-    return f"SearXNG/{VERSION_TAG} {settings['outgoing']['useragent_suffix']}".strip()
+def searxng_useragent(suffix: str = "") -> str:
+    """Return the SearXNG User Agent.
+
+    The UA header is build up from a string template like::
+
+       SearXNG/{VERSION_TAG} {suffix}
+
+    If argument is empty, ``suffix`` is taken from (first wins):
+
+    1. :ref:`useragent_suffix <settings outgoing.useragent_suffix>`
+    2. :ref:`contact_url <settings general.contact_url>`
+    """
+
+    if not suffix:
+        suffix = get_setting("outgoing.useragent_suffix", "") or ""
+    if not suffix:
+        suffix = get_setting("general.contact_url", "") or ""
+    suffix = suffix.removeprefix("mailto:").strip()
+    return f"SearXNG/{VERSION_TAG} {suffix}".strip()
 
 
 def gen_useragent(os_string: str | None = None) -> str:
@@ -440,7 +466,7 @@ def to_string(obj: t.Any) -> str:
     return repr(obj)
 
 
-def ecma_unescape(string: str) -> str:
+def ecma_unescape(text: str) -> str:
     """Python implementation of the unescape javascript function
 
     https://www.ecma-international.org/ecma-262/6.0/#sec-unescape-string
@@ -455,20 +481,20 @@ def ecma_unescape(string: str) -> str:
         'ó'
     """
     # "%u5409" becomes "吉"
-    string = _ECMA_UNESCAPE4_RE.sub(lambda e: chr(int(e.group(1), 16)), string)
+    text = _ECMA_UNESCAPE4_RE.sub(lambda e: chr(int(e.group(1), 16)), text)
     # "%20" becomes " ", "%F3" becomes "ó"
-    string = _ECMA_UNESCAPE2_RE.sub(lambda e: chr(int(e.group(1), 16)), string)
-    return string
+    text = _ECMA_UNESCAPE2_RE.sub(lambda e: chr(int(e.group(1), 16)), text)
+    return text
 
 
-def remove_pua_from_str(string: str):
+def remove_pua_from_str(text: str):
     """Removes unicode's "PRIVATE USE CHARACTER"s (PUA_) from a string.
 
     .. _PUA: https://en.wikipedia.org/wiki/Private_Use_Areas
     """
     pua_ranges = ((0xE000, 0xF8FF), (0xF0000, 0xFFFFD), (0x100000, 0x10FFFD))
     s: list[str] = []
-    for c in string:
+    for c in text:
         i = ord(c)
         if any(a <= i <= b for (a, b) in pua_ranges):
             continue
@@ -592,13 +618,24 @@ def eval_xpath_getindex(
     return default
 
 
-def get_embeded_stream_url(url: str):
-    """
-    Converts a standard video URL into its embed format. Supported services include Youtube,
-    Facebook, Instagram, TikTok, Dailymotion, and Bilibili.
+def get_embedded_stream_url(url: str) -> str:
+    """Converts a standard video URL into its embed format.
+
+    Supported services include:
+
+    - Youtube
+    - Facebook
+    - Instagram
+    - TikTok
+    - Dailymotion
+    - Bilibili
+
+    The function is suitable for the field :obj:`MainResult.iframe_src
+    <searx.result_types.MainResult.iframe_src>`.  If ``url`` is not from one of
+    the supported services, an empty string is returned.
     """
     parsed_url = urlparse(url)
-    iframe_src = None
+    iframe_src = ""
 
     # YouTube
     if parsed_url.netloc in ['www.youtube.com', 'youtube.com'] and parsed_url.path == '/watch' and parsed_url.query:
@@ -735,13 +772,13 @@ def js_obj_str_to_json_str(js_obj_str: str) -> str:
             if in_string == "'":
                 p = p.replace('"', r'\"')
             parts[i] = p
-            # deal with the sequence blackslash then quote
-            # since js_obj_str splits on quote, we detect this case:
-            # * the previous part ends with a black slash
-            # * the current part is a single quote
-            # when detected the blackslash is removed on the previous part
+            # drop a trailing \ that was escaping the quote
+            # leave it if it has been escaped twice as a literal i.e. two \ and ' in a row
             if blackslash_just_before and p[:1] == "'":
-                parts[i - 1] = parts[i - 1][:-1]
+                prev = parts[i - 1]
+                num_backslashes = len(prev) - len(prev.rstrip("\\"))
+                if num_backslashes % 2 == 1:
+                    parts[i - 1] = prev[:-1]
 
         elif in_string is None and p in ('"', "'", "`"):
             # we are not in string but p is string delimiter
@@ -782,10 +819,121 @@ def js_obj_str_to_json_str(js_obj_str: str) -> str:
     return s
 
 
-def parse_duration_string(duration_str: str) -> timedelta | None:
-    """Parse a time string in format MM:SS or HH:MM:SS and convert it to a `timedelta` object.
+def js_find_matching_bracket(text: str, start: int, open_char: str = "{", close_char: str = "}") -> int:
+    """Return index of the matching closing bracket, safely ignoring JS string literals."""
+    depth = 0
+    i = start
+    in_string = None
+    escape_ = False
 
-    Returns None if the provided string doesn't match any of the formats.
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if escape_:
+                escape_ = False
+            elif c == "\\":
+                escape_ = True
+            elif c == in_string:
+                in_string = None
+        elif c in ('"', "'", "`"):
+            in_string = c
+        elif c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise ValueError(f"unbalanced {open_char}{close_char} starting at {start}")
+
+
+def js_split_args(args_str: str) -> list[str]:
+    """Split a JS argument list, respecting strings and nested brackets."""
+    args: list[str] = []
+    last_pos = 0
+    in_string = None
+    escape_ = False
+    depth = 0
+
+    for idx, c in enumerate(f"{args_str},"):
+        if in_string:
+            if escape_:
+                escape_ = False
+            elif c == "\\":
+                escape_ = True
+            elif c == in_string:
+                in_string = None
+        elif c in ('"', "'", "`"):
+            in_string = c
+        elif c in ("(", "[", "{"):
+            depth += 1
+        elif c in (")", "]", "}"):
+            depth -= 1
+        elif c == "," and depth == 0:
+            if item := args_str[last_pos:idx].strip():
+                args.append(item)
+            last_pos = idx + 1
+    return args
+
+
+def js_find_variable_positions(js_obj: str) -> list[tuple[str, int]]:
+    """Find all variables referenced in the JavaScript object."""
+    # pylint: disable=too-many-branches
+    # pylint: disable=unsubscriptable-object
+
+    matches: list[tuple[str, int]] = []
+
+    in_string = False
+    in_escape = False
+
+    # flat array like [1,2,3], not e.g. [{"a": 3}]
+    in_flat_array = False
+    # if the current position is inside the place of
+    # a JS value, e.g. the range of ` bar` in {"foo": bar}
+    in_value = False
+    current_var: tuple[str, int] | None = None
+
+    for pos, c in enumerate(js_obj):
+        if in_string:
+            if in_escape:
+                in_escape = False
+            elif c == "\\":
+                in_escape = True
+            elif c == in_string:
+                in_string = None
+        elif c in ("'", "\"", "`"):
+            in_string = c
+        elif c == ":":
+            in_value = True
+        elif c in (",", "{", "}", "[", "]"):
+            # handle matching variables in arrays like [a,b,c]
+            # i.e. if we encounter a "," in such a flat array,
+            # we're still inside a value
+            if c == "[":
+                in_flat_array = True
+            elif c != ",":
+                in_flat_array = False
+            in_value = in_flat_array
+            if current_var:
+                # reached end of variable name
+                if current_var[0] not in ("void0", "true", "false", "null", "undefined"):
+                    matches.append(current_var)
+                current_var = None
+        elif in_value:
+            if current_var and c in (string.ascii_letters + string.digits + "_$"):
+                current_var = (current_var[0] + c, current_var[1])
+            elif c in string.ascii_letters + "_$":
+                # start of new variable name
+                current_var = (c, pos)
+
+    return matches
+
+
+def parse_duration_string(duration_str: str) -> timedelta | None:
+    """Parse a time string in format MM:SS or HH:MM:SS and convert it to a
+    :obj:`datetime.timedelta` object.
+
+    Returns ``None`` if the provided string doesn't match any of the formats.
     """
     duration_str = duration_str.strip()
 
@@ -794,7 +942,7 @@ def parse_duration_string(duration_str: str) -> timedelta | None:
 
     try:
         # prepending ["00"] here inits hours to 0 if they are not provided
-        time_parts = (["00"] + duration_str.split(":"))[:3]
+        time_parts = (["00"] + duration_str.split(":"))[-3:]
         hours, minutes, seconds = map(int, time_parts)
         return timedelta(hours=hours, minutes=minutes, seconds=seconds)
 
@@ -804,10 +952,109 @@ def parse_duration_string(duration_str: str) -> timedelta | None:
     return None
 
 
-# Format the video duration
-def format_duration(duration: str | int) -> str:
-    seconds = int(duration)
-    length = time.gmtime(seconds)
-    if length.tm_hour:
-        return time.strftime("%H:%M:%S", length)
-    return time.strftime("%M:%S", length)
+def _array_startswith(arr: bytes, prefix: bytes) -> bool:
+    return arr[: len(prefix)] == prefix
+
+
+def solve_altcha(parameters: dict[str, t.Any], maxCounter: int = 1000) -> tuple[str, int] | None:
+    """Solves Altcha CAPTCHAs. It derives keys using PBKDF2 until the derived
+    key starts with the ``keyPrefix``` from the challenge. If the solver does not
+    finish after ``maxCounter`` iterations, returns ``None``."""
+
+    nonce = bytes.fromhex(parameters["nonce"])
+    salt = bytes.fromhex(parameters["salt"])
+    keyPrefix = bytes.fromhex(parameters["keyPrefix"])
+    cost = parameters["cost"]
+    keyLength = parameters["keyLength"]
+    # e.g. "PBKDF2/SHA-256" -> "sha256"
+    hashAlgorithm = parameters["algorithm"].split("/")[-1].replace("-", "").lower()
+
+    counter = 0
+    while counter < maxCounter:
+        # Appends the counter to the nonce, i.e. writes the counter as a big-endian 32-bit integer.
+        secret = nonce + counter.to_bytes(length=4)
+
+        key = pbkdf2_hmac(hash_name=hashAlgorithm, password=secret, salt=salt, iterations=cost, dklen=keyLength)
+        if _array_startswith(key, keyPrefix):
+            return key.hex(), counter
+
+        counter += 1
+
+    return None
+
+
+def solve_anubis(resp: "SXNG_Response"):
+    payload_raw = extract_text(eval_xpath(resp.html(), "//script[@id='anubis_challenge']"))
+    if not payload_raw:
+        raise SearxEngineAPIException("failed to find anubis challenge")
+
+    challenge = json.loads(payload_raw)["challenge"]
+
+    if challenge["method"] == "preact":
+        return solve_anubis_preact_challenge(resp)
+
+    if challenge["method"] == "fast":
+        return solve_anubis_pow(resp)
+
+    raise SearxEngineAPIException(f"no solver for anubis {challenge['method']}")
+
+
+def solve_anubis_pow(resp: "SXNG_Response", max_difficulty: int = 4) -> dict[str, str]:
+    """Anubis POW solver.
+
+    Returns the cookies from the response of the solved challenge."""
+    payload_raw = extract_text(eval_xpath(resp.html(), "//script[@id='anubis_challenge']"))
+    if not payload_raw:
+        raise SearxEngineAPIException("failed to find anubis challenge")
+
+    payload = json.loads(payload_raw)
+    challenge = payload["challenge"]
+    difficulty = int(payload["rules"]["difficulty"])
+    if difficulty > max_difficulty:
+        raise SearxEngineCaptchaException(message="Anubis difficulty too high")
+
+    prefix = "0" * difficulty
+    blob = challenge["randomData"].encode()
+    for nonce in range(16**difficulty * 8):  # max search is 8x average search, e^-8 = 0.034% will fail
+        digest = hashlib.sha256(blob + str(nonce).encode()).hexdigest()
+        if digest.startswith(prefix):
+            break
+    else:
+        raise SearxEngineCaptchaException(message="startpage: Anubis failed")
+
+    base_url = resp.url.base_url
+    params = {
+        "id": challenge["id"],
+        "response": digest,
+        "nonce": nonce,
+        "redir": str(resp.url),
+        "elapsedTime": "1",
+    }
+
+    pass_resp = get(
+        f"{base_url}/.within.website/x/cmd/anubis/api/pass-challenge",
+        params=params,
+        cookies=resp.cookies,
+        allow_redirects=False,
+        raise_for_httperror=False,
+    )
+    return dict(pass_resp.cookies)
+
+
+def solve_anubis_preact_challenge(resp: "SXNG_Response") -> dict[str, str]:
+    """Solves the Preact challenge from the Anubis bot blocker."""
+    preact_json = extract_text(eval_xpath(resp.html(), "//script[@id='preact_info']"))
+    if not preact_json:
+        raise SearxEngineAPIException("failed to extract Anubis challenge")
+    preact_challenge = json.loads(preact_json)
+
+    result = sha256(preact_challenge["challenge"].encode()).hexdigest()
+
+    # difficulty * 80ms is the minum hardcoded time in Anubis to solve the challenge
+    difficulty = int(preact_challenge["difficulty"])
+    sleep(0.08 * difficulty)
+
+    url = f"{resp.url.base_url}{preact_challenge['redir']}&result={result}"
+    challenge_resp = get(url, cookies=resp.cookies, allow_redirects=False, raise_for_httperror=False)
+
+    return dict(challenge_resp.cookies)

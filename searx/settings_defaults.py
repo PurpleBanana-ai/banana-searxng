@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Implementation of the default settings."""
+
 from __future__ import annotations
 
 import typing as t
@@ -184,7 +185,7 @@ SCHEMA: dict[str, t.Any] = {
         'debug': SettingsValue(bool, False, 'SEARXNG_DEBUG'),
         'instance_name': SettingsValue(str, 'SearXNG'),
         'privacypolicy_url': SettingsValue((None, False, str), None),
-        'contact_url': SettingsValue((None, False, str), None),
+        'contact_url': SettingsValue((None, False, str), "", "SEARXNG_CONTACT_URL"),
         'donation_url': SettingsValue((bool, str), "https://docs.searxng.org/donate.html"),
         'enable_metrics': SettingsValue(bool, True),
         'open_metrics': SettingsValue(str, ''),
@@ -247,14 +248,12 @@ SCHEMA: dict[str, t.Any] = {
     },
     "preferences": SettingsPref,
     'outgoing': {
-        'useragent_suffix': SettingsValue(str, ''),
+        'useragent_suffix': SettingsValue((None, False, str), ""),
         'request_timeout': SettingsValue(numbers.Real, 3.0),
         'enable_http2': SettingsValue(bool, True),
         'verify': SettingsValue((bool, str), True),
         'max_request_timeout': SettingsValue((None, numbers.Real), None),
         'pool_connections': SettingsValue(int, 100),
-        'pool_maxsize': SettingsValue(int, 10),
-        'keepalive_expiry': SettingsValue(numbers.Real, 5.0),
         # default maximum redirect
         # from https://github.com/psf/requests/blob/8c211a96cdbe9fe320d63d9e1ae15c5c07e179f8/requests/models.py#L55
         'max_redirects': SettingsValue(int, 30),

@@ -164,6 +164,7 @@ Terms / phrases that you keep coming across:
    https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Accept-Language
 
 """
+
 # pylint: disable=global-statement
 
 import json
@@ -171,7 +172,6 @@ import re
 import typing as t
 
 import babel
-import lxml.html
 
 from searx import locales
 from searx.enginelib import EngineCache
@@ -469,7 +469,7 @@ def response(resp: "SXNG_Response") -> EngineResults:
     if resp.status_code == 303:
         return res
 
-    doc = lxml.html.fromstring(resp.text)
+    doc = resp.html()
     params = resp.search_params
 
     if is_ddg_captcha(doc):
@@ -492,12 +492,15 @@ def response(resp: "SXNG_Response") -> EngineResults:
 
     # just select "web-result" and ignore results of class "result--ad result--ad--small"
     for div_result in eval_xpath(doc, '//div[@id="links"]/div[contains(@class, "web-result")]'):
+        url = eval_xpath_getindex(div_result, ".//h2/a/@href", 0, default=None)
+        if not url:
+            continue
         _title = eval_xpath(div_result, ".//h2/a")
         _content = eval_xpath_getindex(div_result, './/a[contains(@class, "result__snippet")]', 0, [])
         res.add(
             res.types.MainResult(
                 title=extract_text(_title) or "",
-                url=eval_xpath(div_result, ".//h2/a/@href")[0],
+                url=url,
                 content=extract_text(_content) or "",
             )
         )
@@ -510,12 +513,13 @@ def response(resp: "SXNG_Response") -> EngineResults:
         and "Your user agent:" not in zero_click
         and "URL Decoded:" not in zero_click
     ):
-        res.add(
-            res.types.Answer(
-                answer=zero_click,
-                url=eval_xpath_getindex(doc, '//div[@id="zero_click_abstract"]/a/@href', 0),
+        if zero_click_url := eval_xpath_getindex(doc, '//div[@id="zero_click_abstract"]/a/@href', 0, None):
+            res.add(
+                res.types.Answer(
+                    answer=zero_click,
+                    url=zero_click_url,
+                )
             )
-        )
     return res
 
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """WebApp"""
+
 # pylint: disable=use-dict-literal
 
 import json
@@ -18,7 +19,7 @@ import urllib.parse
 from urllib.parse import urlencode, urlparse, unquote
 
 import warnings
-import httpx
+from curl_cffi.requests.exceptions import RequestException
 
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name
@@ -116,8 +117,7 @@ from searx import favicons
 from searx.valkeydb import initialize as valkey_initialize
 from searx.sxng_locales import sxng_locales
 import searx.search
-from searx.network import stream as http_stream, set_context_network_name
-
+from searx.network import stream as http_stream
 
 logger = logger.getChild('webapp')
 
@@ -186,7 +186,7 @@ def code_highlighter(codelines, language=None, hl_lines=None, strip_whitespace=T
         lexer = get_lexer_by_name(language, stripall=strip_whitespace, stripnl=strip_new_lines)
 
     except Exception as e:  # pylint: disable=broad-except
-        logger.warning("pygments lexer: %s " % e)
+        logger.warning("pygments lexer: %s ", e)
         # if lexer is not found, using default one
         lexer = get_lexer_by_name('text', stripall=strip_whitespace, stripnl=strip_new_lines)
 
@@ -323,11 +323,35 @@ def image_proxify(url: str):
 def get_translations():
     return {
         # when there is autocompletion
-        'no_item_found': gettext('No item found'),
+        "no_item_found": gettext("No item found"),
         # /preferences: the source of the engine description (wikipedata, wikidata, website)
-        'Source': gettext('Source'),
+        "Source": gettext("Source"),
         # infinite scroll
-        'error_loading_next_page': gettext('Error loading the next page'),
+        "error_loading_next_page": gettext("Error loading the next page"),
+        # keyboard hotkeys help (client/simple/src/js/main/keyboard.ts)
+        "close": gettext("close"),
+        "hotkeys_navigation_title": gettext("How to navigate SearXNG with hotkeys"),
+        "hotkeys_category_control": gettext("Control"),
+        "hotkeys_category_results": gettext("Results"),
+        "hotkeys_category_navigation": gettext("Navigation"),
+        "hotkeys_category_other": gettext("Other"),
+        "hotkeys_remove_focus": gettext("remove focus from the focused input"),
+        "hotkeys_copy_url": gettext("copy url of the selected result to the clipboard"),
+        "hotkeys_toggle_help": gettext("toggle help window"),
+        "hotkeys_focus_search": gettext("focus on the search input"),
+        "hotkeys_next_page": gettext("go to next page"),
+        "hotkeys_open_result": gettext("open search result"),
+        "hotkeys_previous_page": gettext("go to previous page"),
+        "hotkeys_reload_page": gettext("reload page from the server"),
+        "hotkeys_open_new_tab": gettext("open the result in a new tab"),
+        "hotkeys_select_previous": gettext("select previous search result"),
+        "hotkeys_select_next": gettext("select next search result"),
+        "hotkeys_page_up": gettext("scroll one page up"),
+        "hotkeys_half_page_down": gettext("scroll half a page down"),
+        "hotkeys_page_down": gettext("scroll one page down"),
+        "hotkeys_scroll_top": gettext("scroll to the top of the page"),
+        "hotkeys_half_page_up": gettext("scroll half a page up"),
+        "hotkeys_scroll_bottom": gettext("scroll to the bottom of the page"),
     }
 
 
@@ -959,6 +983,7 @@ def preferences():
         # fmt: off
         'preferences.html',
         preferences = True,
+        engines_with_tokens = any(getattr(e, "tokens", None) for e in engines.values()),
         selected_categories = get_selected_categories(sxng_request.preferences, sxng_request.form),
         locales = LOCALE_NAMES,
         current_locale = sxng_request.preferences.get_value("locale"),
@@ -975,7 +1000,7 @@ def preferences():
         shortcuts = {y: x for x, y in engine_shortcuts.items()},
         themes = themes,
         plugins_storage = searx.plugins.STORAGE.info,
-        current_doi_resolver = get_doi_resolver(),
+        current_doi_resolver = sxng_request.preferences.get_value("doi_resolver"),
         allowed_plugins = allowed_plugins,
         preferences_url_params = sxng_request.preferences.get_as_url_params(),
         locked_preferences = get_setting("preferences").lock,
@@ -987,7 +1012,7 @@ def preferences():
 app.add_url_rule('/favicon_proxy', methods=['GET'], endpoint="favicon_proxy", view_func=favicons.favicon_proxy)
 
 
-@app.route('/image_proxy', methods=['GET'])
+@app.route('/image', methods=['GET'])
 def image_proxy():
     # pylint: disable=too-many-return-statements, too-many-branches
 
@@ -1008,7 +1033,6 @@ def image_proxy():
             'Sec-GPC': '1',
             'DNT': '1',
         }
-        set_context_network_name('image_proxy')
         resp, stream = http_stream(method='GET', url=url, headers=request_headers, allow_redirects=True)
         content_length = resp.headers.get('Content-Length')
         if content_length and content_length.isdigit() and int(content_length) > maximum_size:
@@ -1027,7 +1051,7 @@ def image_proxy():
             return '', 400
 
         forward_resp = True
-    except httpx.HTTPError:
+    except RequestException:
         logger.exception('HTTP error')
         return '', 400
     finally:
@@ -1036,7 +1060,7 @@ def image_proxy():
             # we make sure to close the response between searxng and the HTTP server
             try:
                 resp.close()
-            except httpx.HTTPError:
+            except RequestException:
                 logger.exception('HTTP error on closing')
 
     def close_stream():
@@ -1046,15 +1070,15 @@ def image_proxy():
                 resp.close()
             del resp
             del stream
-        except httpx.HTTPError as e:
-            logger.debug('Exception while closing response', e)
+        except RequestException as e:
+            logger.debug('Exception while closing response: %s', e)
 
     try:
         headers = dict_subset(resp.headers, {'Content-Type', 'Content-Encoding', 'Content-Length', 'Length'})
         response = Response(stream, mimetype=resp.headers['Content-Type'], headers=headers, direct_passthrough=True)
         response.call_on_close(close_stream)
         return response
-    except httpx.HTTPError:
+    except RequestException:
         close_stream()
         return '', 400
 
@@ -1119,17 +1143,13 @@ def stats():
 
     technical_report = []
     for error in engine_reliabilities.get(selected_engine_name, {}).get('errors', []):
-        technical_report.append(
-            f"\
+        technical_report.append(f"\
             Error: {error['exception_classname'] or error['log_message']} \
             Parameters: {error['log_parameters']} \
             File name: {error['filename'] }:{ error['line_no'] } \
             Error Function: {error['function']} \
             Code: {error['code']} \
-            ".replace(
-                ' ' * 12, ''
-            ).strip()
-        )
+            ".replace(' ' * 12, '').strip())
     technical_report = ' '.join(technical_report)
 
     engine_stats['time'] = sorted(engine_stats['time'], reverse=reverse, key=get_key)
@@ -1177,7 +1197,7 @@ def robots():
         """User-agent: *
 Allow: /info/en/about
 Disallow: /stats
-Disallow: /image_proxy
+Disallow: /image
 Disallow: /preferences
 Disallow: /*?*q=*
 """,
